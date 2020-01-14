@@ -1,16 +1,17 @@
 package org.vertexium.elasticsearch5.bulk;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
-import org.elasticsearch.action.ActionRequest;
 import org.elasticsearch.action.bulk.BulkItemResponse;
 import org.elasticsearch.action.bulk.BulkRequest;
 import org.elasticsearch.action.bulk.BulkRequestBuilder;
 import org.elasticsearch.action.bulk.BulkResponse;
 import org.elasticsearch.action.delete.DeleteRequest;
-import org.elasticsearch.action.index.IndexRequest;
 import org.elasticsearch.action.update.UpdateRequest;
+import org.elasticsearch.action.update.UpdateRequestBuilder;
+import org.elasticsearch.script.Script;
+import org.elasticsearch.script.ScriptType;
 import org.vertexium.ElementId;
-import org.vertexium.ElementLocation;
 import org.vertexium.VertexiumException;
 import org.vertexium.elasticsearch5.Elasticsearch5SearchIndex;
 import org.vertexium.elasticsearch5.IndexRefreshTracker;
@@ -22,15 +23,21 @@ import org.vertexium.util.VertexiumLogger;
 import org.vertexium.util.VertexiumLoggerFactory;
 
 import java.time.Duration;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
+/**
+ * All updates to Elasticsearch are sent using bulk requests to speed up indexing.
+ *
+ * Duplicate element updates are collapsed into single updates to reduce the number of refreshes Elasticsearch
+ * has to perform. See
+ * - https://github.com/elastic/elasticsearch/issues/23792#issuecomment-296149685
+ * - https://github.com/debadair/elasticsearch/commit/54cdf40bc5fdecce180ba2e242abca59c7bd1f11
+ */
 public class BulkUpdateService {
     private static final VertexiumLogger LOGGER = VertexiumLoggerFactory.getLogger(BulkUpdateService.class);
     private static final String LOGGER_STACK_TRACE_NAME = BulkUpdateService.class.getName() + ".STACK_TRACE";
@@ -82,7 +89,8 @@ public class BulkUpdateService {
         this.batch = new BulkItemBatch(
             configuration.getMaxBatchSize(),
             configuration.getMaxBatchSizeInBytes(),
-            configuration.getBatchWindowTime()
+            configuration.getBatchWindowTime(),
+            configuration.getLogRequestSizeLimit()
         );
 
         VertexiumMetricRegistry metricRegistry = searchIndex.getMetricsRegistry();
@@ -148,9 +156,9 @@ public class BulkUpdateService {
             try {
                 batchSizeHistogram.update(bulkItems.size());
 
-                BulkRequest bulkRequest = bulkItemsToBulkRequest(bulkItems);
+                BulkItemsToBulkRequestResult bulkItemsToBulkRequestResult = bulkItemsToBulkRequest(bulkItems);
                 BulkResponse bulkResponse = searchIndex.getClient()
-                    .bulk(bulkRequest)
+                    .bulk(bulkItemsToBulkRequestResult.bulkRequest)
                     .get(bulkRequestTimeout.toMillis(), TimeUnit.MILLISECONDS);
 
                 Set<String> indexNames = bulkItems.stream()
@@ -161,11 +169,13 @@ public class BulkUpdateService {
 
                 int itemIndex = 0;
                 for (BulkItemResponse bulkItemResponse : bulkResponse.getItems()) {
-                    BulkItem bulkItem = bulkItems.get(itemIndex++);
-                    if (bulkItemResponse.isFailed()) {
-                        handleFailure(bulkItem, bulkItemResponse);
-                    } else {
-                        handleSuccess(bulkItem);
+                    List<BulkItem> bulkItemsForResponse = bulkItemsToBulkRequestResult.requestsToBulkItems.get(itemIndex++);
+                    for (BulkItem bulkItem : bulkItemsForResponse) {
+                        if (bulkItemResponse.isFailed()) {
+                            handleFailure(bulkItem, bulkItemResponse);
+                        } else {
+                            handleSuccess(bulkItem);
+                        }
                     }
                 }
             } catch (Exception ex) {
@@ -216,21 +226,99 @@ public class BulkUpdateService {
         }
     }
 
-    private BulkRequest bulkItemsToBulkRequest(List<BulkItem> bulkItems) {
+    private static class BulkItemsToBulkRequestResult {
+        BulkRequest bulkRequest;
+        List<List<BulkItem>> requestsToBulkItems;
+    }
+
+    private BulkItemsToBulkRequestResult bulkItemsToBulkRequest(List<BulkItem> bulkItems) {
+        BulkItemsToBulkRequestResult results = new BulkItemsToBulkRequestResult();
+        results.requestsToBulkItems = new ArrayList<>();
         BulkRequestBuilder builder = searchIndex.getClient().prepareBulk();
-        for (BulkItem bulkItem : bulkItems) {
-            ActionRequest actionRequest = bulkItem.getActionRequest();
-            if (actionRequest instanceof IndexRequest) {
-                builder.add((IndexRequest) actionRequest);
-            } else if (actionRequest instanceof UpdateRequest) {
-                builder.add((UpdateRequest) actionRequest);
-            } else if (actionRequest instanceof DeleteRequest) {
-                builder.add((DeleteRequest) actionRequest);
-            } else {
-                throw new VertexiumException("unhandled request type: " + actionRequest.getClass().getName());
+
+        Map<String, List<BulkItem>> byIndexName = bulkItems.stream().collect(Collectors.groupingBy(BulkItem::getIndexName));
+        for (Map.Entry<String, List<BulkItem>> byIndexNameEntry : byIndexName.entrySet()) {
+            String indexName = byIndexNameEntry.getKey();
+            Map<String, List<BulkItem>> byType = byIndexNameEntry.getValue().stream().collect(Collectors.groupingBy(BulkItem::getType));
+
+            for (Map.Entry<String, List<BulkItem>> byTypeEntry : byType.entrySet()) {
+                String type = byTypeEntry.getKey();
+                Map<String, List<BulkItem>> byDocumentId = byTypeEntry.getValue().stream().collect(Collectors.groupingBy(BulkItem::getDocumentId));
+
+                for (Map.Entry<String, List<BulkItem>> byDocumentIdEntry : byDocumentId.entrySet()) {
+                    String documentId = byDocumentIdEntry.getKey();
+                    List<BulkItem> requestBulkItems = byDocumentIdEntry.getValue();
+                    Map<Class<? extends BulkItem>, List<BulkItem>> byBulkItemType = requestBulkItems.stream().collect(Collectors.groupingBy(BulkItem::getClass));
+                    if (byBulkItemType.size() > 1) {
+                        throw new VertexiumException(
+                            "Cannot mix bulk item types in a batch: "
+                                + byBulkItemType.keySet().stream().map(Class::getName).collect(Collectors.joining(","))
+                        );
+                    }
+                    for (Map.Entry<Class<? extends BulkItem>, List<BulkItem>> byBulkItemTypeEntry : byBulkItemType.entrySet()) {
+                        Class<? extends BulkItem> bulkItemType = byBulkItemTypeEntry.getKey();
+                        if (bulkItemType == UpdateBulkItem.class) {
+                            Map<String, String> source = new HashMap<>();
+                            Map<String, Object> fieldsToSet = new HashMap<>();
+                            List<String> fieldsToRemove = new ArrayList<>();
+                            Map<String, String> fieldsToRename = new HashMap<>();
+                            List<String> additionalVisibilities = new ArrayList<>();
+                            List<String> additionalVisibilitiesToDelete = new ArrayList<>();
+
+                            boolean updateOnly = true;
+                            for (BulkItem bulkItem : requestBulkItems) {
+                                UpdateBulkItem updateBulkItem = (UpdateBulkItem) bulkItem;
+                                source.putAll(updateBulkItem.getSource());
+                                fieldsToSet.putAll(updateBulkItem.getFieldsToSet());
+                                fieldsToRemove.addAll(updateBulkItem.getFieldsToRemove());
+                                fieldsToRename.putAll(updateBulkItem.getFieldsToRename());
+                                additionalVisibilities.addAll(updateBulkItem.getAdditionalVisibilities());
+                                additionalVisibilitiesToDelete.addAll(updateBulkItem.getAdditionalVisibilitiesToDelete());
+                                if (!updateBulkItem.isExistingElement()) {
+                                    updateOnly = false;
+                                }
+                            }
+
+                            UpdateRequestBuilder updateRequestBuilder = searchIndex.getClient()
+                                .prepareUpdate(indexName, type, documentId);
+                            if (!updateOnly) {
+                                updateRequestBuilder = updateRequestBuilder
+                                    .setScriptedUpsert(true)
+                                    .setUpsert(source);
+                            }
+                            UpdateRequest updateRequest = updateRequestBuilder
+                                .setScript(new Script(
+                                    ScriptType.STORED,
+                                    "painless",
+                                    "updateFieldsOnDocumentScript",
+                                    ImmutableMap.of(
+                                        "fieldsToSet", fieldsToSet,
+                                        "fieldsToRemove", fieldsToRemove,
+                                        "fieldsToRename", fieldsToRename,
+                                        "additionalVisibilities", additionalVisibilities,
+                                        "additionalVisibilitiesToDelete", additionalVisibilitiesToDelete
+                                    )
+                                ))
+                                .setRetryOnConflict(Elasticsearch5SearchIndex.MAX_RETRIES)
+                                .request();
+                            builder.add(updateRequest);
+                            results.requestsToBulkItems.add(requestBulkItems);
+                        } else if (bulkItemType == DeleteBulkItem.class) {
+                            DeleteRequest deleteRequest = searchIndex.getClient()
+                                .prepareDelete(indexName, type, documentId)
+                                .request();
+                            builder.add(deleteRequest);
+                            results.requestsToBulkItems.add(requestBulkItems);
+                        } else {
+                            throw new VertexiumException("unhandled bulk request item: " + bulkItemType.getName());
+                        }
+                    }
+                }
             }
         }
-        return builder.request();
+
+        results.bulkRequest = builder.request();
+        return results;
     }
 
     public void flush() {
@@ -260,25 +348,73 @@ public class BulkUpdateService {
         });
     }
 
-    public CompletableFuture<Void> addUpdate(ElementLocation elementLocation, UpdateRequest updateRequest) {
-        return add(new UpdateBulkItem(elementLocation, updateRequest));
+    public CompletableFuture<Void> addUpdate(
+        String indexName,
+        String type,
+        String docId,
+        ElementId elementId,
+        Map<String, String> source,
+        Map<String, Object> fieldsToSet,
+        Collection<String> fieldsToRemove,
+        Map<String, String> fieldsToRename,
+        Collection<String> additionalVisibilities,
+        Collection<String> additionalVisibilitiesToDelete,
+        boolean existingElement
+    ) {
+        return add(new UpdateBulkItem(
+            indexName,
+            type,
+            docId,
+            elementId,
+            source,
+            fieldsToSet,
+            fieldsToRemove,
+            fieldsToRename,
+            additionalVisibilities,
+            additionalVisibilitiesToDelete,
+            existingElement
+        ));
     }
 
     public CompletableFuture<Void> addUpdate(
-        ElementLocation elementLocation,
+        String indexName,
+        String type,
+        String docId,
+        ElementId elementId,
         String extendedDataTableName,
-        String rowId,
-        UpdateRequest updateRequest
+        String extendedDataRowId,
+        Map<String, String> source,
+        Map<String, Object> fieldsToSet,
+        Collection<String> fieldsToRemove,
+        Map<String, String> fieldsToRename,
+        Collection<String> additionalVisibilities,
+        Collection<String> additionalVisibilitiesToDelete,
+        boolean existingElement
     ) {
-        return add(new UpdateBulkItem(elementLocation, extendedDataTableName, rowId, updateRequest));
+        return add(new UpdateBulkItem(
+            indexName,
+            type,
+            docId,
+            elementId,
+            extendedDataTableName,
+            extendedDataRowId,
+            source,
+            fieldsToSet,
+            fieldsToRemove,
+            fieldsToRename,
+            additionalVisibilities,
+            additionalVisibilitiesToDelete,
+            existingElement
+        ));
     }
 
     public CompletableFuture<Void> addDelete(
-        ElementId elementId,
+        String indexName,
+        String type,
         String docId,
-        DeleteRequest deleteRequest
+        ElementId elementId
     ) {
-        return add(new DeleteBulkItem(elementId, docId, deleteRequest));
+        return add(new DeleteBulkItem(indexName, type, docId, elementId));
     }
 
     private CompletableFuture<Void> add(BulkItem bulkItem) {

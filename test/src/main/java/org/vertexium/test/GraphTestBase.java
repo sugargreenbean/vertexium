@@ -8094,6 +8094,7 @@ public abstract class GraphTestBase {
         graph.prepareVertex("v1", VISIBILITY_A)
             .setProperty("text", "Joe", VISIBILITY_A)
             .save(AUTHORIZATIONS_A);
+        graph.flush(); // Not sure why this needs to be here
         graph.prepareVertex("v2", VISIBILITY_A)
             .setProperty("text", "joe", VISIBILITY_A)
             .save(AUTHORIZATIONS_A);

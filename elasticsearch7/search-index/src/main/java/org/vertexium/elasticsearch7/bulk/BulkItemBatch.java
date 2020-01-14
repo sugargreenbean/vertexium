@@ -1,5 +1,7 @@
 package org.vertexium.elasticsearch7.bulk;
 
+import org.vertexium.util.VertexiumLogger;
+import org.vertexium.util.VertexiumLoggerFactory;
 import org.vertexium.util.VertexiumReadWriteLock;
 import org.vertexium.util.VertexiumStampedLock;
 
@@ -8,18 +10,26 @@ import java.util.ArrayList;
 import java.util.List;
 
 public class BulkItemBatch {
+    private static final VertexiumLogger LOGGER = VertexiumLoggerFactory.getLogger(BulkItemBatch.class);
     private final VertexiumReadWriteLock lock = new VertexiumStampedLock();
     private final int maxBatchSize;
     private final int maxBatchSizeInBytes;
     private final long batchWindowTimeMillis;
+    private final Integer logRequestSizeLimit;
     private long lastFlush;
     private List<BulkItem> batch = new ArrayList<>();
     private int currentBatchSizeInBytes = 0;
 
-    public BulkItemBatch(int maxBatchSize, int maxBatchSizeInBytes, Duration batchWindowTime) {
+    public BulkItemBatch(
+        int maxBatchSize,
+        int maxBatchSizeInBytes,
+        Duration batchWindowTime,
+        Integer logRequestSizeLimit
+    ) {
         this.maxBatchSize = maxBatchSize;
         this.maxBatchSizeInBytes = maxBatchSizeInBytes;
         this.batchWindowTimeMillis = batchWindowTime.toMillis();
+        this.logRequestSizeLimit = logRequestSizeLimit;
         this.lastFlush = System.currentTimeMillis();
     }
 
@@ -27,11 +37,22 @@ public class BulkItemBatch {
         return lock.executeInWriteLock(() -> {
             if (canAdd(item)) {
                 batch.add(item);
+                logRequestSize(item);
                 currentBatchSizeInBytes += item.getSize();
                 return true;
             }
             return false;
         });
+    }
+
+    private void logRequestSize(BulkItem item) {
+        if (logRequestSizeLimit == null) {
+            return;
+        }
+        int sizeInBytes = item.getSize();
+        if (sizeInBytes > logRequestSizeLimit) {
+            LOGGER.warn("Large document detected (id: %s). Size in bytes: %d", item.getElementId(), sizeInBytes);
+        }
     }
 
     private boolean canAdd(BulkItem item) {

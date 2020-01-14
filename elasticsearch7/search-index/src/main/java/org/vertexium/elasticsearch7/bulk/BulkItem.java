@@ -1,14 +1,12 @@
 package org.vertexium.elasticsearch7.bulk;
 
-import org.elasticsearch.action.ActionRequest;
 import org.vertexium.ElementId;
-import org.vertexium.elasticsearch7.utils.ElasticsearchRequestUtils;
 
-public class BulkItem {
+public abstract class BulkItem {
     private final String indexName;
     private final ElementId elementId;
-    private final int size;
-    private final ActionRequest actionRequest;
+    private final String type;
+    private final String documentId;
     private final long createdTime;
     private final BulkItemCompletableFuture addedToBatchFuture;
     private final BulkItemCompletableFuture completedFuture;
@@ -18,15 +16,17 @@ public class BulkItem {
 
     public BulkItem(
         String indexName,
-        ElementId elementId,
-        ActionRequest actionRequest
+        String type,
+        String documentId,
+        ElementId elementId
     ) {
+        this.indexName = indexName;
+        this.type = type;
+        this.documentId = documentId;
+        this.elementId = elementId;
+
         this.addedToBatchFuture = new BulkItemCompletableFuture(this);
         this.completedFuture = new BulkItemCompletableFuture(this);
-        this.indexName = indexName;
-        this.elementId = elementId;
-        this.size = ElasticsearchRequestUtils.getSize(actionRequest);
-        this.actionRequest = actionRequest;
         this.createdOrLastTriedTime = this.createdTime = System.currentTimeMillis();
         if (BulkUpdateService.LOGGER_STACK_TRACE.isTraceEnabled()) {
             this.stackTrace = Thread.currentThread().getStackTrace();
@@ -43,13 +43,15 @@ public class BulkItem {
         return elementId;
     }
 
-    public int getSize() {
-        return size;
+    public String getType() {
+        return type;
     }
 
-    public ActionRequest getActionRequest() {
-        return actionRequest;
+    public String getDocumentId() {
+        return documentId;
     }
+
+    public abstract int getSize();
 
     public long getCreatedTime() {
         return createdTime;
@@ -85,6 +87,6 @@ public class BulkItem {
 
     @Override
     public String toString() {
-        return String.format("%s {elementId=%s, actionRequest=%s}", getClass().getSimpleName(), elementId, actionRequest);
+        return String.format("%s {elementId=%s}", getClass().getSimpleName(), elementId);
     }
 }
